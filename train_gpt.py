@@ -939,9 +939,20 @@ def score_doc_windows_with_adapter_ttt(
     return loss_sum, token_count, byte_count
 
 
+def clear_rotary_caches(model: GPT) -> None:
+    # Scoring runs under inference_mode(), so RoPE caches created there cannot
+    # be reused by later autograd-enabled TTT updates.
+    for block in model.blocks:
+        rotary = block.attn.rotary
+        rotary._seq_len_cached = 0
+        rotary._cos_cached = None
+        rotary._sin_cached = None
+
+
 def train_model_on_doc(args: Hyperparameters, model: GPT, doc: Tensor, ttt_params: list[Tensor], optimizer: torch.optim.Optimizer) -> None:
     if args.ttt_epochs <= 0 or doc.numel() <= 1:
         return
+    clear_rotary_caches(model)
     model.train()
     for _ in range(args.ttt_epochs):
         for start_tok in range(0, doc.numel() - 1, args.train_seq_len):
@@ -997,6 +1008,25 @@ def run_eval_hypothesis(
         b_tok += tc
         b_byte += bc
     _, baseline_bpb = summarize("eval_baseline_doc_sliding", b_loss, b_tok, b_byte, time.perf_counter() - t0)
+
+    adapter_only_bpb = baseline_bpb
+    if args.ttt_doc_adapter_rank > 0:
+        adapter_only = DocTTTOutputAdapter(
+            args.model_dim, args.vocab_size, args.ttt_doc_adapter_rank, args.ttt_doc_adapter_init_std, device
+        )
+        t0 = time.perf_counter()
+        a_loss = a_tok = a_byte = 0.0
+        for doc in docs:
+            adapter_only.reset_parameters()
+            ls, tc, bc = score_doc_windows_with_adapter_ttt(
+                args, base_model, adapter_only, doc, seq_len, args.eval_stride,
+                base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            )
+            a_loss += ls
+            a_tok += tc
+            a_byte += bc
+        _, adapter_only_bpb = summarize("eval_adapter_only_doc_ttt", a_loss, a_tok, a_byte, time.perf_counter() - t0)
+        log0(f"eval_adapter_only_doc_ttt_delta_vs_baseline:{adapter_only_bpb - baseline_bpb:+.6f}")
 
     if not args.ttt_enabled:
         return
@@ -1058,6 +1088,7 @@ def run_eval_hypothesis(
             train_model_on_doc(args, hybrid_model, doc, hybrid_params, hybrid_optimizer)
     _, hybrid_bpb = summarize("eval_hybrid_doc_ttt", h_loss, h_tok, h_byte, time.perf_counter() - t0)
     log0(f"eval_hybrid_doc_ttt_delta_vs_baseline:{hybrid_bpb - baseline_bpb:+.6f}")
+    log0(f"eval_hybrid_doc_ttt_delta_vs_adapter_only:{hybrid_bpb - adapter_only_bpb:+.6f}")
     log0(f"eval_hybrid_doc_ttt_delta_vs_persistent:{hybrid_bpb - persistent_bpb:+.6f}")
 
 
