@@ -1223,11 +1223,11 @@ def main() -> None:
         log0(f"eval_only:1 load_checkpoint:{args.load_checkpoint}")
         base_model.load_state_dict(load_checkpoint_state_dict(args.load_checkpoint), strict=True)
         flat_val_loss, flat_val_bpb = eval_val(
-            base_model,
             args,
-            device,
+            base_model,
             rank,
             world_size,
+            device,
             grad_accum_steps,
             val_tokens,
             base_bytes_lut,
