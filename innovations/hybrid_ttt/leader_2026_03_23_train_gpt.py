@@ -1346,47 +1346,64 @@ def eval_val_sliding_ttt(
     return val_loss, val_bpb
 
 
-def eval_val_doc_adapter_ttt(
+def eval_val_doc_local_ttt(
     args: Hyperparameters, base_model: GPT, rank: int, world_size: int,
     device: torch.device, val_tokens: Tensor, base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor, is_boundary_token_lut: Tensor,
-    bos_token_id: int, log0=print,
+    bos_token_id: int, use_adapter: bool, use_model_ttt: bool,
+    log_prefix: str, log0=print,
 ) -> tuple[float, float]:
-    """Experimental hybrid TTT: persistent full-model updates plus a reset-per-doc side adapter."""
+    """Document-local score-first TTT with configurable adapter/base-model updates."""
     if world_size != 1:
         raise NotImplementedError("document-local adapter TTT is currently implemented for single-GPU experiments only")
-    if args.ttt_doc_adapter_rank <= 0:
+    if not use_adapter and not use_model_ttt:
+        raise ValueError("document-local TTT requires at least one adaptation mechanism")
+    if use_adapter and args.ttt_doc_adapter_rank <= 0:
         raise ValueError("TTT_DOC_ADAPTER_RANK must be positive when doc adapter TTT is enabled")
 
     score_seq_len = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
     docs = split_validation_documents(val_tokens, bos_token_id, args.ttt_doc_adapter_max_docs)
-    doc_adapter = DocTTTOutputAdapter(
-        args.model_dim,
-        args.vocab_size,
-        args.ttt_doc_adapter_rank,
-        args.ttt_doc_adapter_init_std,
-        device,
-    )
+    doc_adapter = None
+    if use_adapter:
+        doc_adapter = DocTTTOutputAdapter(
+            args.model_dim,
+            args.vocab_size,
+            args.ttt_doc_adapter_rank,
+            args.ttt_doc_adapter_init_std,
+            device,
+        )
 
-    frozen_block_ids = set(range(min(args.ttt_freeze_blocks, len(base_model.blocks))))
     ttt_params = []
-    for name, p in base_model.named_parameters():
-        freeze = any(f"blocks.{bi}." in name for bi in frozen_block_ids)
-        if freeze:
+    model_optimizer = None
+    if use_model_ttt:
+        frozen_block_ids = set(range(min(args.ttt_freeze_blocks, len(base_model.blocks))))
+        for name, p in base_model.named_parameters():
+            freeze = any(f"blocks.{bi}." in name for bi in frozen_block_ids)
+            if freeze:
+                p.requires_grad_(False)
+            else:
+                p.requires_grad_(True)
+                ttt_params.append(p)
+        model_optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+    else:
+        for p in base_model.parameters():
             p.requires_grad_(False)
-        else:
-            p.requires_grad_(True)
-            ttt_params.append(p)
-    model_optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
 
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
+    mode_parts = []
+    if use_model_ttt:
+        mode_parts.append("base")
+    if use_adapter:
+        mode_parts.append("adapter")
     log0(
-        f"ttt_doc_adapter:start docs={len(docs)} score_seq_len={score_seq_len} stride={args.eval_stride} "
-        f"adapter_rank={args.ttt_doc_adapter_rank} adapter_lr={args.ttt_doc_adapter_lr} "
-        f"adapter_epochs={args.ttt_doc_adapter_epochs} freeze_blocks={args.ttt_freeze_blocks}"
+        f"{log_prefix}:start docs={len(docs)} score_seq_len={score_seq_len} stride={args.eval_stride} "
+        f"mode:{'+'.join(mode_parts)} freeze_blocks={args.ttt_freeze_blocks} "
+        f"adapter_rank={args.ttt_doc_adapter_rank if use_adapter else 0} "
+        f"adapter_lr={args.ttt_doc_adapter_lr if use_adapter else 0.0} "
+        f"adapter_epochs={args.ttt_doc_adapter_epochs if use_adapter else 0}"
     )
     t0 = time.perf_counter()
 
@@ -1395,9 +1412,12 @@ def eval_val_doc_adapter_ttt(
         if n_targets <= 0:
             continue
 
-        doc_adapter.reset_parameters()
-        adapter_optimizer = torch.optim.SGD(doc_adapter.parameters(), lr=args.ttt_doc_adapter_lr)
-        doc_adapter.train()
+        adapter_optimizer = None
+        if use_adapter:
+            assert doc_adapter is not None
+            doc_adapter.reset_parameters()
+            adapter_optimizer = torch.optim.SGD(doc_adapter.parameters(), lr=args.ttt_doc_adapter_lr)
+            doc_adapter.train()
 
         base_model.eval()
         for ws in range(0, n_targets, args.eval_stride):
@@ -1413,7 +1433,7 @@ def eval_val_doc_adapter_ttt(
             with torch.inference_mode():
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     hidden = base_model.forward_features(x)
-                logits = project_logits_with_adapter(base_model, hidden, doc_adapter)
+                logits = project_logits_with_adapter(base_model, hidden, doc_adapter if use_adapter else None)
                 scored_logits = logits[:, s:wlen, :]
                 scored_targets = y[:, s:wlen]
                 scored_nll = F.cross_entropy(
@@ -1429,7 +1449,8 @@ def eval_val_doc_adapter_ttt(
             tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
             byte_count += tb.sum()
 
-            if args.ttt_doc_adapter_epochs > 0 and scored_targets.numel() > 0:
+            if use_adapter and args.ttt_doc_adapter_epochs > 0 and scored_targets.numel() > 0:
+                assert doc_adapter is not None and adapter_optimizer is not None
                 hidden_sel = hidden[:, s:wlen, :].float().detach().clone()
                 target_sel = scored_targets.detach().clone()
                 for _ in range(args.ttt_doc_adapter_epochs):
@@ -1448,7 +1469,8 @@ def eval_val_doc_adapter_ttt(
                     adapter_optimizer.step()
 
         is_last_doc = di == len(docs) - 1
-        if not is_last_doc and args.ttt_epochs > 0:
+        if use_model_ttt and not is_last_doc and args.ttt_epochs > 0:
+            assert model_optimizer is not None
             clear_rotary_caches(base_model)
             base_model.train()
             cos_lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * di / max(len(docs) - 1, 1)))
@@ -1473,7 +1495,7 @@ def eval_val_doc_adapter_ttt(
             elapsed = time.perf_counter() - t0
             rl = loss_sum.item() / max(token_count.item(), 1)
             rbpb = rl / math.log(2.0) * (token_count.item() / max(byte_count.item(), 1)) if token_count.item() > 0 else 0.0
-            log0(f"  ttt_doc_adapter [{di+1}/{len(docs)}] bpb={rbpb:.6f} time={elapsed:.1f}s")
+            log0(f"  {log_prefix} [{di+1}/{len(docs)}] bpb={rbpb:.6f} time={elapsed:.1f}s")
 
     val_loss = (loss_sum / token_count).item()
     val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
@@ -1481,10 +1503,25 @@ def eval_val_doc_adapter_ttt(
         p.requires_grad_(True)
     base_model.eval()
     log0(
-        f"ttt_doc_adapter:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} "
+        f"{log_prefix}:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} "
         f"elapsed={time.perf_counter() - t0:.1f}s"
     )
     return val_loss, val_bpb
+
+
+def eval_val_doc_adapter_ttt(
+    args: Hyperparameters, base_model: GPT, rank: int, world_size: int,
+    device: torch.device, val_tokens: Tensor, base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor, is_boundary_token_lut: Tensor,
+    bos_token_id: int, log0=print,
+) -> tuple[float, float]:
+    """Experimental hybrid TTT: persistent full-model updates plus a reset-per-doc side adapter."""
+    return eval_val_doc_local_ttt(
+        args, base_model, rank, world_size, device,
+        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        bos_token_id=bos_token_id, use_adapter=True, use_model_ttt=True,
+        log_prefix="ttt_doc_adapter", log0=log0,
+    )
 
 
 # --- GPTQ-lite int6 quantization ---
@@ -1812,19 +1849,43 @@ def main() -> None:
             )
             log0(f"eval_float_legal_ttt val_loss:{legal_ttt_loss:.4f} val_bpb:{legal_ttt_bpb:.4f}")
             log0(f"eval_float_legal_ttt_delta_vs_{baseline_label}:{legal_ttt_bpb - baseline_bpb:+.6f}")
-            if args.ttt_doc_adapter_rank > 0:
-                if world_size != 1:
-                    log0("eval_float_doc_adapter_ttt skipped: world_size>1 is not supported for the hybrid path")
-                else:
+            if world_size != 1:
+                log0("eval_float_doc_local_ttt skipped: world_size>1 is not supported for the document-local ablations")
+            else:
+                restore_eval_model()
+                doc_base_loss, doc_base_bpb = eval_val_doc_local_ttt(
+                    args, base_model, rank, world_size, device,
+                    val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                    bos_token_id=int(sp.bos_id()), use_adapter=False, use_model_ttt=True,
+                    log_prefix="ttt_doc_base", log0=log0,
+                )
+                log0(f"eval_float_doc_base_ttt val_loss:{doc_base_loss:.4f} val_bpb:{doc_base_bpb:.4f}")
+                log0(f"eval_float_doc_base_ttt_delta_vs_{baseline_label}:{doc_base_bpb - baseline_bpb:+.6f}")
+                log0(f"eval_float_doc_base_ttt_delta_vs_legal_ttt:{doc_base_bpb - legal_ttt_bpb:+.6f}")
+                if args.ttt_doc_adapter_rank > 0:
                     restore_eval_model()
-                    hybrid_loss, hybrid_bpb = eval_val_doc_adapter_ttt(
+                    doc_adapter_loss, doc_adapter_bpb = eval_val_doc_local_ttt(
                         args, base_model, rank, world_size, device,
                         val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                        bos_token_id=int(sp.bos_id()), log0=log0,
+                        bos_token_id=int(sp.bos_id()), use_adapter=True, use_model_ttt=False,
+                        log_prefix="ttt_doc_adapter_only", log0=log0,
                     )
-                    log0(f"eval_float_doc_adapter_ttt val_loss:{hybrid_loss:.4f} val_bpb:{hybrid_bpb:.4f}")
-                    log0(f"eval_float_doc_adapter_ttt_delta_vs_{baseline_label}:{hybrid_bpb - baseline_bpb:+.6f}")
-                    log0(f"eval_float_doc_adapter_ttt_delta_vs_legal_ttt:{hybrid_bpb - legal_ttt_bpb:+.6f}")
+                    log0(f"eval_float_doc_adapter_only_ttt val_loss:{doc_adapter_loss:.4f} val_bpb:{doc_adapter_bpb:.4f}")
+                    log0(f"eval_float_doc_adapter_only_ttt_delta_vs_{baseline_label}:{doc_adapter_bpb - baseline_bpb:+.6f}")
+                    log0(f"eval_float_doc_adapter_only_ttt_delta_vs_legal_ttt:{doc_adapter_bpb - legal_ttt_bpb:+.6f}")
+
+                    restore_eval_model()
+                    hybrid_loss, hybrid_bpb = eval_val_doc_local_ttt(
+                        args, base_model, rank, world_size, device,
+                        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                        bos_token_id=int(sp.bos_id()), use_adapter=True, use_model_ttt=True,
+                        log_prefix="ttt_doc_hybrid", log0=log0,
+                    )
+                    log0(f"eval_float_doc_hybrid_ttt val_loss:{hybrid_loss:.4f} val_bpb:{hybrid_bpb:.4f}")
+                    log0(f"eval_float_doc_hybrid_ttt_delta_vs_{baseline_label}:{hybrid_bpb - baseline_bpb:+.6f}")
+                    log0(f"eval_float_doc_hybrid_ttt_delta_vs_legal_ttt:{hybrid_bpb - legal_ttt_bpb:+.6f}")
+                    log0(f"eval_float_doc_hybrid_ttt_delta_vs_doc_base_ttt:{hybrid_bpb - doc_base_bpb:+.6f}")
+                    log0(f"eval_float_doc_hybrid_ttt_delta_vs_doc_adapter_only_ttt:{hybrid_bpb - doc_adapter_bpb:+.6f}")
         if distributed:
             dist.destroy_process_group()
         return
