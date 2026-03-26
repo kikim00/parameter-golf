@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RECORD_SCRIPT="$SCRIPT_DIR/../records/track_10min_16mb/2026-03-23_LeakyReLU_LegalTTT_ParallelMuon/train_gpt.py"
+RECORD_SCRIPT="$SCRIPT_DIR/../leader_2026_03_23_train_gpt.py"
 
 export RUN_ID="${RUN_ID:-runpod_5090_leader_train}"
 export DATA_PATH="${DATA_PATH:-./data/datasets/fineweb10B_sp1024}"

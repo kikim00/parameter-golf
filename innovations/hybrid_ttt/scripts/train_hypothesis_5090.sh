@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PORTABLE_TRAIN_GPT="$SCRIPT_DIR/../portable_train_gpt.py"
+
 RUN_ID="${RUN_ID:-runpod_5090_hypothesis_train}"
 DATA_PATH="${DATA_PATH:-./data/datasets/fineweb10B_sp1024}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.model}"
@@ -16,4 +19,4 @@ export MAX_WALLCLOCK_SECONDS="${MAX_WALLCLOCK_SECONDS:-0}"
 export VAL_LOSS_EVERY="${VAL_LOSS_EVERY:-0}"
 export VAL_MAX_TOKENS="${VAL_MAX_TOKENS:-131072}"
 
-python3 train_gpt.py
+python3 "$PORTABLE_TRAIN_GPT"

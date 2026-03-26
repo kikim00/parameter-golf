@@ -2,6 +2,8 @@
 set -euo pipefail
 
 CHECKPOINT="${1:-final_model.pt}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PORTABLE_TRAIN_GPT="$SCRIPT_DIR/../portable_train_gpt.py"
 RUN_ID="${RUN_ID:-runpod_5090_hypothesis_eval}"
 DATA_PATH="${DATA_PATH:-./data/datasets/fineweb10B_sp1024}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.model}"
@@ -28,4 +30,4 @@ export TTT_DOC_ADAPTER_INIT_STD="${TTT_DOC_ADAPTER_INIT_STD:-0.01}"
 export TTT_DOC_ADAPTER_WEIGHT_DECAY="${TTT_DOC_ADAPTER_WEIGHT_DECAY:-0.0}"
 export TTT_DOC_ADAPTER_GRAD_CLIP="${TTT_DOC_ADAPTER_GRAD_CLIP:-1.0}"
 
-python3 train_gpt.py
+python3 "$PORTABLE_TRAIN_GPT"
