@@ -4,7 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INNOVATION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_DIR="$(cd "$INNOVATION_DIR/../.." && pwd)"
-PY_SCRIPT="$INNOVATION_DIR/leader_2026_03_23_train_gpt.py"
+SUBMISSION_DIR="$INNOVATION_DIR/submissions/track_10min_16mb/2026-03-26_Hybrid_DocLocalAdapterTTT"
+PY_SCRIPT="$SUBMISSION_DIR/train_gpt.py"
 
 RUN_ID="${RUN_ID:-hybrid_submission_8xh100_$(date -u +%Y%m%dT%H%M%SZ)}"
 EVIDENCE_DIR="${EVIDENCE_DIR:-$INNOVATION_DIR/submission_runs/$RUN_ID}"

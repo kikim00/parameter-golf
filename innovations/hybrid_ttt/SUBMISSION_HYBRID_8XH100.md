@@ -2,6 +2,11 @@ Hybrid 8xH100 submission path
 
 This is the current 8xH100 launch path for the document-local adapter submission in the innovation tree.
 
+Canonical submission-style folder:
+- [train_gpt.py](/Users/kdk/parameter-golf/innovations/hybrid_ttt/submissions/track_10min_16mb/2026-03-26_Hybrid_DocLocalAdapterTTT/train_gpt.py)
+- [README.md](/Users/kdk/parameter-golf/innovations/hybrid_ttt/submissions/track_10min_16mb/2026-03-26_Hybrid_DocLocalAdapterTTT/README.md)
+- [submission.json](/Users/kdk/parameter-golf/innovations/hybrid_ttt/submissions/track_10min_16mb/2026-03-26_Hybrid_DocLocalAdapterTTT/submission.json)
+
 Important behavior:
 - Training uses the leader-style 11-layer recipe in [leader_2026_03_23_train_gpt.py](/Users/kdk/parameter-golf/innovations/hybrid_ttt/leader_2026_03_23_train_gpt.py).
 - Final evaluation enables the document-local adapter path by setting `TTT_DOC_ADAPTER_RANK>0`.
