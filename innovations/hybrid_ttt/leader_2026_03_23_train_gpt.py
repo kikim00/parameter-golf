@@ -1354,8 +1354,6 @@ def eval_val_doc_local_ttt(
     log_prefix: str, log0=print,
 ) -> tuple[float, float]:
     """Document-local score-first TTT with configurable adapter/base-model updates."""
-    if world_size != 1:
-        raise NotImplementedError("document-local adapter TTT is currently implemented for single-GPU experiments only")
     if not use_adapter and not use_model_ttt:
         raise ValueError("document-local TTT requires at least one adaptation mechanism")
     if use_adapter and args.ttt_doc_adapter_rank <= 0:
@@ -1363,6 +1361,8 @@ def eval_val_doc_local_ttt(
 
     score_seq_len = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
     docs = split_validation_documents(val_tokens, bos_token_id, args.ttt_doc_adapter_max_docs)
+    total_docs = len(docs)
+    local_docs = docs[rank::world_size]
     doc_adapter = None
     if use_adapter:
         doc_adapter = DocTTTOutputAdapter(
@@ -1399,15 +1399,20 @@ def eval_val_doc_local_ttt(
     if use_adapter:
         mode_parts.append("adapter")
     log0(
-        f"{log_prefix}:start docs={len(docs)} score_seq_len={score_seq_len} stride={args.eval_stride} "
+        f"{log_prefix}:start docs_total={total_docs} docs_local={len(local_docs)} score_seq_len={score_seq_len} stride={args.eval_stride} "
         f"mode:{'+'.join(mode_parts)} freeze_blocks={args.ttt_freeze_blocks} "
         f"adapter_rank={args.ttt_doc_adapter_rank if use_adapter else 0} "
         f"adapter_lr={args.ttt_doc_adapter_lr if use_adapter else 0.0} "
         f"adapter_epochs={args.ttt_doc_adapter_epochs if use_adapter else 0}"
     )
+    if world_size > 1 and use_model_ttt:
+        log0(
+            f"{log_prefix}:distributed mode uses rank-local persistent base-model TTT streams; "
+            "metrics are reduced globally after scoring"
+        )
     t0 = time.perf_counter()
 
-    for di, doc in enumerate(docs):
+    for di, doc in enumerate(local_docs):
         n_targets = doc.numel() - 1
         if n_targets <= 0:
             continue
@@ -1468,12 +1473,12 @@ def eval_val_doc_local_ttt(
                     torch.nn.utils.clip_grad_norm_(doc_adapter.parameters(), args.ttt_doc_adapter_grad_clip)
                     adapter_optimizer.step()
 
-        is_last_doc = di == len(docs) - 1
+        is_last_doc = di == len(local_docs) - 1
         if use_model_ttt and not is_last_doc and args.ttt_epochs > 0:
             assert model_optimizer is not None
             clear_rotary_caches(base_model)
             base_model.train()
-            cos_lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * di / max(len(docs) - 1, 1)))
+            cos_lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * di / max(len(local_docs) - 1, 1)))
             for pg in model_optimizer.param_groups:
                 pg["lr"] = cos_lr
             for _ep in range(args.ttt_epochs):
@@ -1491,12 +1496,16 @@ def eval_val_doc_local_ttt(
                     torch.nn.utils.clip_grad_norm_(ttt_params, args.ttt_grad_clip)
                     model_optimizer.step()
 
-        if rank == 0 and (di % 25 == 0 or di == len(docs) - 1):
+        if rank == 0 and (di % 25 == 0 or di == len(local_docs) - 1):
             elapsed = time.perf_counter() - t0
             rl = loss_sum.item() / max(token_count.item(), 1)
             rbpb = rl / math.log(2.0) * (token_count.item() / max(byte_count.item(), 1)) if token_count.item() > 0 else 0.0
-            log0(f"  {log_prefix} [{di+1}/{len(docs)}] bpb={rbpb:.6f} time={elapsed:.1f}s")
+            log0(f"  {log_prefix} [{di+1}/{len(local_docs)} local, total_docs={total_docs}] bpb={rbpb:.6f} time={elapsed:.1f}s")
 
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
     val_loss = (loss_sum / token_count).item()
     val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
     for p in base_model.parameters():
@@ -1849,43 +1858,40 @@ def main() -> None:
             )
             log0(f"eval_float_legal_ttt val_loss:{legal_ttt_loss:.4f} val_bpb:{legal_ttt_bpb:.4f}")
             log0(f"eval_float_legal_ttt_delta_vs_{baseline_label}:{legal_ttt_bpb - baseline_bpb:+.6f}")
-            if world_size != 1:
-                log0("eval_float_doc_local_ttt skipped: world_size>1 is not supported for the document-local ablations")
-            else:
+            restore_eval_model()
+            doc_base_loss, doc_base_bpb = eval_val_doc_local_ttt(
+                args, base_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                bos_token_id=int(sp.bos_id()), use_adapter=False, use_model_ttt=True,
+                log_prefix="ttt_doc_base", log0=log0,
+            )
+            log0(f"eval_float_doc_base_ttt val_loss:{doc_base_loss:.4f} val_bpb:{doc_base_bpb:.4f}")
+            log0(f"eval_float_doc_base_ttt_delta_vs_{baseline_label}:{doc_base_bpb - baseline_bpb:+.6f}")
+            log0(f"eval_float_doc_base_ttt_delta_vs_legal_ttt:{doc_base_bpb - legal_ttt_bpb:+.6f}")
+            if args.ttt_doc_adapter_rank > 0:
                 restore_eval_model()
-                doc_base_loss, doc_base_bpb = eval_val_doc_local_ttt(
+                doc_adapter_loss, doc_adapter_bpb = eval_val_doc_local_ttt(
                     args, base_model, rank, world_size, device,
                     val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                    bos_token_id=int(sp.bos_id()), use_adapter=False, use_model_ttt=True,
-                    log_prefix="ttt_doc_base", log0=log0,
+                    bos_token_id=int(sp.bos_id()), use_adapter=True, use_model_ttt=False,
+                    log_prefix="ttt_doc_adapter_only", log0=log0,
                 )
-                log0(f"eval_float_doc_base_ttt val_loss:{doc_base_loss:.4f} val_bpb:{doc_base_bpb:.4f}")
-                log0(f"eval_float_doc_base_ttt_delta_vs_{baseline_label}:{doc_base_bpb - baseline_bpb:+.6f}")
-                log0(f"eval_float_doc_base_ttt_delta_vs_legal_ttt:{doc_base_bpb - legal_ttt_bpb:+.6f}")
-                if args.ttt_doc_adapter_rank > 0:
-                    restore_eval_model()
-                    doc_adapter_loss, doc_adapter_bpb = eval_val_doc_local_ttt(
-                        args, base_model, rank, world_size, device,
-                        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                        bos_token_id=int(sp.bos_id()), use_adapter=True, use_model_ttt=False,
-                        log_prefix="ttt_doc_adapter_only", log0=log0,
-                    )
-                    log0(f"eval_float_doc_adapter_only_ttt val_loss:{doc_adapter_loss:.4f} val_bpb:{doc_adapter_bpb:.4f}")
-                    log0(f"eval_float_doc_adapter_only_ttt_delta_vs_{baseline_label}:{doc_adapter_bpb - baseline_bpb:+.6f}")
-                    log0(f"eval_float_doc_adapter_only_ttt_delta_vs_legal_ttt:{doc_adapter_bpb - legal_ttt_bpb:+.6f}")
+                log0(f"eval_float_doc_adapter_only_ttt val_loss:{doc_adapter_loss:.4f} val_bpb:{doc_adapter_bpb:.4f}")
+                log0(f"eval_float_doc_adapter_only_ttt_delta_vs_{baseline_label}:{doc_adapter_bpb - baseline_bpb:+.6f}")
+                log0(f"eval_float_doc_adapter_only_ttt_delta_vs_legal_ttt:{doc_adapter_bpb - legal_ttt_bpb:+.6f}")
 
-                    restore_eval_model()
-                    hybrid_loss, hybrid_bpb = eval_val_doc_local_ttt(
-                        args, base_model, rank, world_size, device,
-                        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                        bos_token_id=int(sp.bos_id()), use_adapter=True, use_model_ttt=True,
-                        log_prefix="ttt_doc_hybrid", log0=log0,
-                    )
-                    log0(f"eval_float_doc_hybrid_ttt val_loss:{hybrid_loss:.4f} val_bpb:{hybrid_bpb:.4f}")
-                    log0(f"eval_float_doc_hybrid_ttt_delta_vs_{baseline_label}:{hybrid_bpb - baseline_bpb:+.6f}")
-                    log0(f"eval_float_doc_hybrid_ttt_delta_vs_legal_ttt:{hybrid_bpb - legal_ttt_bpb:+.6f}")
-                    log0(f"eval_float_doc_hybrid_ttt_delta_vs_doc_base_ttt:{hybrid_bpb - doc_base_bpb:+.6f}")
-                    log0(f"eval_float_doc_hybrid_ttt_delta_vs_doc_adapter_only_ttt:{hybrid_bpb - doc_adapter_bpb:+.6f}")
+                restore_eval_model()
+                hybrid_loss, hybrid_bpb = eval_val_doc_local_ttt(
+                    args, base_model, rank, world_size, device,
+                    val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                    bos_token_id=int(sp.bos_id()), use_adapter=True, use_model_ttt=True,
+                    log_prefix="ttt_doc_hybrid", log0=log0,
+                )
+                log0(f"eval_float_doc_hybrid_ttt val_loss:{hybrid_loss:.4f} val_bpb:{hybrid_bpb:.4f}")
+                log0(f"eval_float_doc_hybrid_ttt_delta_vs_{baseline_label}:{hybrid_bpb - baseline_bpb:+.6f}")
+                log0(f"eval_float_doc_hybrid_ttt_delta_vs_legal_ttt:{hybrid_bpb - legal_ttt_bpb:+.6f}")
+                log0(f"eval_float_doc_hybrid_ttt_delta_vs_doc_base_ttt:{hybrid_bpb - doc_base_bpb:+.6f}")
+                log0(f"eval_float_doc_hybrid_ttt_delta_vs_doc_adapter_only_ttt:{hybrid_bpb - doc_adapter_bpb:+.6f}")
         if distributed:
             dist.destroy_process_group()
         return
