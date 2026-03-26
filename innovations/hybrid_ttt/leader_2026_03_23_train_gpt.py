@@ -1730,13 +1730,25 @@ def main() -> None:
         if not args.load_checkpoint:
             raise ValueError("EVAL_ONLY=1 requires LOAD_CHECKPOINT=/path/to/final_model.pt or final_model.int6.ptz")
         log0(f"eval_only:1 load_checkpoint:{args.load_checkpoint}")
-        base_model.load_state_dict(load_checkpoint_state_dict(args.load_checkpoint, base_model.state_dict(), args.num_layers), strict=True)
+        base_model.load_state_dict(
+            load_checkpoint_state_dict(args.load_checkpoint, base_model.state_dict(), args.num_layers),
+            strict=True,
+        )
+        eval_init_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
+
+        def restore_eval_model() -> None:
+            base_model.load_state_dict(eval_init_state, strict=True)
+            clear_rotary_caches(base_model)
+            base_model.eval()
+
         flat_val_loss, flat_val_bpb = eval_val(
             args, base_model, rank, world_size, device, grad_accum_steps,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             eval_seq_len=effective_eval_seq_len,
         )
         log0(f"eval_float_flat val_loss:{flat_val_loss:.4f} val_bpb:{flat_val_bpb:.4f}")
+        baseline_label = "flat"
+        baseline_bpb = flat_val_bpb
         sw_seq_len = effective_eval_seq_len
         if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
             sw_val_loss, sw_val_bpb = eval_val_sliding(
@@ -1745,20 +1757,30 @@ def main() -> None:
                 stride=args.eval_stride, eval_seq_len=sw_seq_len,
             )
             log0(f"eval_float_sliding val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} stride:{args.eval_stride}")
-        if args.ttt_enabled and args.ttt_doc_adapter_rank > 0:
-            ttt_loss, ttt_bpb = eval_val_doc_adapter_ttt(
-                args, base_model, rank, world_size, device,
-                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                bos_token_id=int(sp.bos_id()), log0=log0,
-            )
-            log0(f"eval_float_doc_adapter_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f}")
-        elif args.ttt_enabled:
-            ttt_loss, ttt_bpb = eval_val_sliding_ttt(
+            baseline_label = "sliding"
+            baseline_bpb = sw_val_bpb
+        if args.ttt_enabled:
+            restore_eval_model()
+            legal_ttt_loss, legal_ttt_bpb = eval_val_sliding_ttt(
                 args, base_model, rank, world_size, device,
                 val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
                 stride=args.eval_stride, log0=log0,
             )
-            log0(f"eval_float_legal_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f}")
+            log0(f"eval_float_legal_ttt val_loss:{legal_ttt_loss:.4f} val_bpb:{legal_ttt_bpb:.4f}")
+            log0(f"eval_float_legal_ttt_delta_vs_{baseline_label}:{legal_ttt_bpb - baseline_bpb:+.6f}")
+            if args.ttt_doc_adapter_rank > 0:
+                if world_size != 1:
+                    log0("eval_float_doc_adapter_ttt skipped: world_size>1 is not supported for the hybrid path")
+                else:
+                    restore_eval_model()
+                    hybrid_loss, hybrid_bpb = eval_val_doc_adapter_ttt(
+                        args, base_model, rank, world_size, device,
+                        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                        bos_token_id=int(sp.bos_id()), log0=log0,
+                    )
+                    log0(f"eval_float_doc_adapter_ttt val_loss:{hybrid_loss:.4f} val_bpb:{hybrid_bpb:.4f}")
+                    log0(f"eval_float_doc_adapter_ttt_delta_vs_{baseline_label}:{hybrid_bpb - baseline_bpb:+.6f}")
+                    log0(f"eval_float_doc_adapter_ttt_delta_vs_legal_ttt:{hybrid_bpb - legal_ttt_bpb:+.6f}")
         if distributed:
             dist.destroy_process_group()
         return
