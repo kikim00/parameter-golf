@@ -51,6 +51,8 @@ class Hyperparameters:
     eval_only = bool(int(os.environ.get("EVAL_ONLY", "0")))
     load_checkpoint = os.environ.get("LOAD_CHECKPOINT", "")
     attn_backend = os.environ.get("ATTN_BACKEND", "auto")
+    eval_doc_sample_fraction = float(os.environ.get("EVAL_DOC_SAMPLE_FRACTION", "1.0"))
+    eval_doc_sample_seed = int(os.environ.get("EVAL_DOC_SAMPLE_SEED", "1337"))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
@@ -338,6 +340,27 @@ def split_validation_documents(val_tokens: Tensor, bos_token_id: int, max_docs: 
     if not docs:
         raise ValueError("validation stream did not contain any non-empty BOS-delimited documents")
     return docs
+
+
+def sample_validation_documents(
+    val_tokens: Tensor,
+    bos_token_id: int,
+    sample_fraction: float,
+    sample_seed: int,
+) -> tuple[Tensor, int, int]:
+    if not (0.0 < sample_fraction <= 1.0):
+        raise ValueError(f"EVAL_DOC_SAMPLE_FRACTION must be in (0, 1], got {sample_fraction}")
+    docs = split_validation_documents(val_tokens, bos_token_id, max_docs=0)
+    total_docs = len(docs)
+    if sample_fraction >= 1.0 or total_docs <= 1:
+        return val_tokens, total_docs, total_docs
+    keep_docs = max(1, int(round(total_docs * sample_fraction)))
+    rng = random.Random(sample_seed)
+    keep_indices = sorted(rng.sample(range(total_docs), keep_docs))
+    sampled_tokens = torch.cat([docs[i] for i in keep_indices]).contiguous()
+    if sampled_tokens.numel() <= 1:
+        raise ValueError("sampled validation subset is too small")
+    return sampled_tokens, total_docs, keep_docs
 def eval_val(
     args: Hyperparameters,
     model: nn.Module,
@@ -1682,6 +1705,16 @@ def main() -> None:
     effective_eval_seq_len = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
     val_seq_len = max(args.train_seq_len, effective_eval_seq_len)
     val_tokens = load_validation_tokens(args.val_files, val_seq_len, args.val_max_tokens)
+    sampled_total_docs = 0
+    sampled_keep_docs = 0
+    if args.eval_only and args.eval_doc_sample_fraction < 1.0:
+        bos_token_id = int(sp.bos_id())
+        val_tokens, sampled_total_docs, sampled_keep_docs = sample_validation_documents(
+            val_tokens,
+            bos_token_id=bos_token_id,
+            sample_fraction=args.eval_doc_sample_fraction,
+            sample_seed=args.eval_doc_sample_seed,
+        )
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
@@ -1690,6 +1723,12 @@ def main() -> None:
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
     if args.val_max_tokens > 0:
         log0(f"WARNING: val_loader:subset val_max_tokens:{args.val_max_tokens}")
+    if args.eval_only and args.eval_doc_sample_fraction < 1.0:
+        log0(
+            f"WARNING: eval_doc_sample fraction:{args.eval_doc_sample_fraction:.4f} "
+            f"seed:{args.eval_doc_sample_seed} docs_kept:{sampled_keep_docs}/{sampled_total_docs} "
+            f"sampled_tokens:{val_tokens.numel() - 1}"
+        )
     CastedLinear._qat_enabled = args.qat_enabled
     base_model = GPT(
         vocab_size=args.vocab_size,
