@@ -24,7 +24,12 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from flash_attn_interface import flash_attn_func as flash_attn_3_func
+try:
+    from flash_attn_interface import flash_attn_func as flash_attn_3_func
+    _HAS_FLASH_ATTN3 = True
+except ImportError:
+    flash_attn_3_func = None
+    _HAS_FLASH_ATTN3 = False
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -34,6 +39,7 @@ class Hyperparameters:
     seed = int(os.environ.get("SEED", 1337))
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 4000))
+    val_max_tokens = int(os.environ.get("VAL_MAX_TOKENS", "0"))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))
@@ -42,6 +48,9 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    eval_only = bool(int(os.environ.get("EVAL_ONLY", "0")))
+    load_checkpoint = os.environ.get("LOAD_CHECKPOINT", "")
+    attn_backend = os.environ.get("ATTN_BACKEND", "auto")
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
@@ -299,11 +308,13 @@ def build_sentencepiece_luts(
         torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
     )
-def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
+def load_validation_tokens(pattern: str, seq_len: int, max_tokens: int = 0) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
+    if max_tokens > 0:
+        tokens = tokens[: max_tokens + 1]
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
@@ -515,6 +526,25 @@ def load_data_shard(file: Path) -> Tensor:
     if tokens_np.size != num_tokens:
         raise ValueError(f"Short read for {file}")
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
+
+
+def load_checkpoint_state_dict(ckpt_path: str, template_sd: dict[str, Tensor], num_layers: int) -> dict[str, Tensor]:
+    path = Path(ckpt_path)
+    if not path.exists():
+        raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
+    if path.suffix == ".pt":
+        state = torch.load(path, map_location="cpu")
+        if not isinstance(state, dict):
+            raise TypeError(f"unsupported checkpoint payload type: {type(state)}")
+        return {str(k): v for k, v in state.items()}
+    if path.suffix == ".ptz":
+        quant_state = torch.load(io.BytesIO(lzma.decompress(path.read_bytes())), map_location="cpu")
+        template_cpu = {k: v.detach().cpu() for k, v in template_sd.items()}
+        unbanked_template = _unbank_state_dict(template_cpu, num_layers)
+        deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"], unbanked_template)
+        return _rebank_state_dict(deq_unbanked, num_layers, template_cpu)
+    raise ValueError(f"unsupported checkpoint format: {ckpt_path}")
+
 class TokenStream:
     def __init__(self, pattern: str):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
@@ -688,7 +718,25 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(q, k, v, causal=True)
+        attn_backend = os.environ.get("ATTN_BACKEND", "auto")
+        if attn_backend not in {"auto", "fa3", "sdpa"}:
+            raise ValueError(f"unsupported ATTN_BACKEND={attn_backend}")
+        if attn_backend in {"auto", "fa3"} and flash_attn_3_func is not None:
+            y = flash_attn_3_func(q, k, v, causal=True)
+        elif attn_backend == "fa3":
+            raise RuntimeError("ATTN_BACKEND=fa3 requested but flash_attn_interface is unavailable")
+        else:
+            q_sdpa = q.transpose(1, 2)
+            k_sdpa = k.transpose(1, 2)
+            v_sdpa = v.transpose(1, 2)
+            y = F.scaled_dot_product_attention(
+                q_sdpa,
+                k_sdpa,
+                v_sdpa,
+                attn_mask=None,
+                is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            ).transpose(1, 2)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         if self.gated_attention:
@@ -1024,6 +1072,14 @@ class DocTTTOutputAdapter(nn.Module):
         return (h @ self.a) @ self.b
 
 
+def clear_rotary_caches(model: GPT) -> None:
+    for block in model.blocks:
+        rotary = block.attn.rotary
+        rotary._seq_len_cached = 0
+        rotary._cos_cached = None
+        rotary._sin_cached = None
+
+
 def project_logits_with_adapter(model: GPT, hidden: Tensor, adapter: DocTTTOutputAdapter | None = None) -> Tensor:
     if model.tie_embeddings:
         logits_proj = F.linear(hidden, model.tok_emb.weight.to(dtype=hidden.dtype))
@@ -1212,6 +1268,7 @@ def eval_val_sliding_ttt(
         # --- Phase 2: TRAIN on this chunk (already scored = legal) ---
         is_last_chunk = (ci == num_chunks - 1)
         if not is_last_chunk and args.ttt_epochs > 0:
+            clear_rotary_caches(base_model)
             base_model.train()
             chunk_seqs = (chunk_end - chunk_start) // seq_len
             if chunk_seqs > 0:
@@ -1369,6 +1426,7 @@ def eval_val_doc_adapter_ttt(
 
         is_last_doc = di == len(docs) - 1
         if not is_last_doc and args.ttt_epochs > 0:
+            clear_rotary_caches(base_model)
             base_model.train()
             cos_lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * di / max(len(docs) - 1, 1)))
             for pg in model_optimizer.param_groups:
@@ -1623,13 +1681,15 @@ def main() -> None:
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     effective_eval_seq_len = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
     val_seq_len = max(args.train_seq_len, effective_eval_seq_len)
-    val_tokens = load_validation_tokens(args.val_files, val_seq_len)
+    val_tokens = load_validation_tokens(args.val_files, val_seq_len, args.val_max_tokens)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    if args.val_max_tokens > 0:
+        log0(f"WARNING: val_loader:subset val_max_tokens:{args.val_max_tokens}")
     CastedLinear._qat_enabled = args.qat_enabled
     base_model = GPT(
         vocab_size=args.vocab_size,
@@ -1666,6 +1726,42 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    if args.eval_only:
+        if not args.load_checkpoint:
+            raise ValueError("EVAL_ONLY=1 requires LOAD_CHECKPOINT=/path/to/final_model.pt or final_model.int6.ptz")
+        log0(f"eval_only:1 load_checkpoint:{args.load_checkpoint}")
+        base_model.load_state_dict(load_checkpoint_state_dict(args.load_checkpoint, base_model.state_dict(), args.num_layers), strict=True)
+        flat_val_loss, flat_val_bpb = eval_val(
+            args, base_model, rank, world_size, device, grad_accum_steps,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            eval_seq_len=effective_eval_seq_len,
+        )
+        log0(f"eval_float_flat val_loss:{flat_val_loss:.4f} val_bpb:{flat_val_bpb:.4f}")
+        sw_seq_len = effective_eval_seq_len
+        if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
+            sw_val_loss, sw_val_bpb = eval_val_sliding(
+                args, base_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=args.eval_stride, eval_seq_len=sw_seq_len,
+            )
+            log0(f"eval_float_sliding val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} stride:{args.eval_stride}")
+        if args.ttt_enabled and args.ttt_doc_adapter_rank > 0:
+            ttt_loss, ttt_bpb = eval_val_doc_adapter_ttt(
+                args, base_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                bos_token_id=int(sp.bos_id()), log0=log0,
+            )
+            log0(f"eval_float_doc_adapter_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f}")
+        elif args.ttt_enabled:
+            ttt_loss, ttt_bpb = eval_val_sliding_ttt(
+                args, base_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=args.eval_stride, log0=log0,
+            )
+            log0(f"eval_float_legal_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f}")
+        if distributed:
+            dist.destroy_process_group()
+        return
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
@@ -1752,7 +1848,9 @@ def main() -> None:
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    resolved_attn_backend = args.attn_backend if args.attn_backend != "auto" else ("fa3" if _HAS_FLASH_ATTN3 else "sdpa")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0(f"attn_backend:{resolved_attn_backend} flash_attn3_available:{_HAS_FLASH_ATTN3}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "

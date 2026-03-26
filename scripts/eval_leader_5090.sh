@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CHECKPOINT="${1:-final_model.pt}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RECORD_SCRIPT="$SCRIPT_DIR/../records/track_10min_16mb/2026-03-23_LeakyReLU_LegalTTT_ParallelMuon/train_gpt.py"
+
+export RUN_ID="${RUN_ID:-runpod_5090_leader_eval}"
+export DATA_PATH="${DATA_PATH:-./data/datasets/fineweb10B_sp1024}"
+export TOKENIZER_PATH="${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.model}"
+export ATTN_BACKEND="${ATTN_BACKEND:-sdpa}"
+export EVAL_ONLY=1
+export LOAD_CHECKPOINT="$CHECKPOINT"
+export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-65536}"
+export VAL_MAX_TOKENS="${VAL_MAX_TOKENS:-0}"
+export TTT_ENABLED="${TTT_ENABLED:-1}"
+export TTT_LR="${TTT_LR:-0.002}"
+export TTT_EPOCHS="${TTT_EPOCHS:-1}"
+export TTT_FREEZE_BLOCKS="${TTT_FREEZE_BLOCKS:-2}"
+export TTT_MOMENTUM="${TTT_MOMENTUM:-0.9}"
+export TTT_BATCH_SEQS="${TTT_BATCH_SEQS:-8}"
+export TTT_GRAD_CLIP="${TTT_GRAD_CLIP:-1.0}"
+export TTT_DOC_ADAPTER_RANK="${TTT_DOC_ADAPTER_RANK:-16}"
+export TTT_DOC_ADAPTER_LR="${TTT_DOC_ADAPTER_LR:-0.5}"
+export TTT_DOC_ADAPTER_EPOCHS="${TTT_DOC_ADAPTER_EPOCHS:-5}"
+export TTT_DOC_ADAPTER_INIT_STD="${TTT_DOC_ADAPTER_INIT_STD:-0.01}"
+export TTT_DOC_ADAPTER_WEIGHT_DECAY="${TTT_DOC_ADAPTER_WEIGHT_DECAY:-0.0}"
+export TTT_DOC_ADAPTER_GRAD_CLIP="${TTT_DOC_ADAPTER_GRAD_CLIP:-1.0}"
+export TTT_DOC_ADAPTER_MAX_DOCS="${TTT_DOC_ADAPTER_MAX_DOCS:-1000}"
+
+python3 "$RECORD_SCRIPT"
