@@ -48,6 +48,7 @@ class Hyperparameters:
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+    val_max_tokens = int(os.environ.get("VAL_MAX_TOKENS", "0"))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
@@ -85,6 +86,25 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+    # Eval-only hypothesis harness.
+    eval_only = bool(int(os.environ.get("EVAL_ONLY", "0")))
+    load_checkpoint = os.environ.get("LOAD_CHECKPOINT", "")
+    eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", "1024")))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", "128"))
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
+    ttt_max_docs = int(os.environ.get("TTT_MAX_DOCS", "200"))
+    ttt_lr = float(os.environ.get("TTT_LR", 0.002))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 1))
+    ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 2))
+    ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
+    ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+    ttt_doc_adapter_rank = int(os.environ.get("TTT_DOC_ADAPTER_RANK", 0))
+    ttt_doc_adapter_lr = float(os.environ.get("TTT_DOC_ADAPTER_LR", 0.5))
+    ttt_doc_adapter_epochs = int(os.environ.get("TTT_DOC_ADAPTER_EPOCHS", 5))
+    ttt_doc_adapter_init_std = float(os.environ.get("TTT_DOC_ADAPTER_INIT_STD", 0.01))
+    ttt_doc_adapter_weight_decay = float(os.environ.get("TTT_DOC_ADAPTER_WEIGHT_DECAY", 0.0))
+    ttt_doc_adapter_grad_clip = float(os.environ.get("TTT_DOC_ADAPTER_GRAD_CLIP", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -204,18 +224,53 @@ def build_sentencepiece_luts(
     )
 
 
-def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
+def load_validation_stream(pattern: str, max_tokens: int = 0) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
     # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
+    if max_tokens > 0:
+        tokens = tokens[: max_tokens + 1]
+    return tokens
+
+
+def load_validation_tokens(pattern: str, seq_len: int, max_tokens: int = 0) -> Tensor:
+    tokens = load_validation_stream(pattern, max_tokens=max_tokens)
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
-
-
+def split_validation_documents(val_tokens: Tensor, bos_token_id: int, max_docs: int = 0) -> list[Tensor]:
+    if bos_token_id < 0:
+        raise ValueError("tokenizer must define BOS for document-local evaluation")
+    starts = (val_tokens == bos_token_id).nonzero(as_tuple=False).flatten().tolist()
+    if not starts:
+        raise ValueError("no BOS tokens found in validation stream")
+    docs: list[Tensor] = []
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else val_tokens.numel()
+        doc = val_tokens[start:end].contiguous()
+        if doc.numel() > 1:
+            docs.append(doc)
+            if max_docs > 0 and len(docs) >= max_docs:
+                break
+    if not docs:
+        raise ValueError("validation stream did not contain any non-empty BOS-delimited documents")
+    return docs
+def load_checkpoint_state_dict(path: str) -> dict[str, Tensor]:
+    ckpt_path = Path(path).expanduser().resolve()
+    if not ckpt_path.is_file():
+        raise FileNotFoundError(ckpt_path)
+    if ckpt_path.suffix == ".ptz":
+        with ckpt_path.open("rb") as f:
+            blob = f.read()
+        obj = torch.load(io.BytesIO(zlib.decompress(blob)), map_location="cpu")
+        return dequantize_state_dict_int8(obj)
+    state = torch.load(ckpt_path, map_location="cpu")
+    if not isinstance(state, dict):
+        raise TypeError(f"Unsupported checkpoint payload type: {type(state)}")
+    return {str(k): v for k, v in state.items()}
 def eval_val(
     args: Hyperparameters,
     model: nn.Module,
@@ -697,7 +752,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward_features(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -711,8 +766,10 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
+        return self.final_norm(x)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        x = self.forward_features(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -722,6 +779,286 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
+
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
+        x = self.forward_features(input_ids)
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
+            logits_proj = self.lm_head(x)
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+class DocTTTOutputAdapter(nn.Module):
+    def __init__(self, model_dim: int, vocab_size: int, rank: int, init_std: float, device: torch.device):
+        super().__init__()
+        if rank <= 0:
+            raise ValueError("document adapter rank must be positive")
+        g = torch.Generator(device="cpu")
+        g.manual_seed(0)
+        a0 = torch.randn(model_dim, rank, generator=g, dtype=torch.float32) * init_std
+        b0 = torch.zeros(rank, vocab_size, dtype=torch.float32)
+        self.register_buffer("_a0", a0, persistent=False)
+        self.register_buffer("_b0", b0, persistent=False)
+        self.a = nn.Parameter(a0.to(device=device))
+        self.b = nn.Parameter(b0.to(device=device))
+
+    @torch.no_grad()
+    def reset_parameters(self) -> None:
+        self.a.copy_(self._a0.to(device=self.a.device))
+        self.b.copy_(self._b0.to(device=self.b.device))
+
+    def forward(self, hidden: Tensor) -> Tensor:
+        h = hidden.float()
+        return (h @ self.a) @ self.b
+def project_logits_with_adapter(model: GPT, hidden: Tensor, adapter: DocTTTOutputAdapter | None = None) -> Tensor:
+    if model.tie_embeddings:
+        logits_proj = F.linear(hidden, model.tok_emb.weight.to(dtype=hidden.dtype))
+    else:
+        if model.lm_head is None:
+            raise RuntimeError("lm_head is required when tie_embeddings=False")
+        logits_proj = F.linear(hidden, model.lm_head.weight.to(dtype=hidden.dtype))
+    if adapter is not None:
+        logits_proj = logits_proj.float() + adapter(hidden)
+    return model.logit_softcap * torch.tanh(logits_proj / model.logit_softcap)
+def score_doc_windows(
+    model: GPT,
+    doc: Tensor,
+    seq_len: int,
+    stride: int,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    adapter: DocTTTOutputAdapter | None = None,
+) -> tuple[float, float, float]:
+    n_targets = doc.numel() - 1
+    if n_targets <= 0:
+        return 0.0, 0.0, 0.0
+    loss_sum = 0.0
+    token_count = 0.0
+    byte_count = 0.0
+    model.eval()
+    for ws in range(0, n_targets, stride):
+        end = min(ws + seq_len, n_targets)
+        wlen = end - ws
+        if wlen <= 0:
+            continue
+        local = doc[ws:end + 1].to(device=base_bytes_lut.device, dtype=torch.int64, non_blocking=True)
+        x = local[:-1].unsqueeze(0)
+        y = local[1:].unsqueeze(0)
+        s = 0 if ws == 0 else max(wlen - stride, 0)
+        with torch.inference_mode():
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                if adapter is None:
+                    logits = model.forward_logits(x)
+                else:
+                    hidden = model.forward_features(x)
+                    logits = project_logits_with_adapter(model, hidden, adapter)
+            scored_logits = logits[:, s:wlen, :]
+            scored_targets = y[:, s:wlen]
+            scored_nll = F.cross_entropy(
+                scored_logits.reshape(-1, scored_logits.size(-1)).float(),
+                scored_targets.reshape(-1),
+                reduction="none",
+            ).to(torch.float64)
+        loss_sum += float(scored_nll.sum().item())
+        token_count += float(scored_targets.numel())
+        prev = x[:, s:wlen].reshape(-1)
+        tgt = scored_targets.reshape(-1)
+        tb = base_bytes_lut[tgt].to(torch.float64)
+        tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+        byte_count += float(tb.sum().item())
+    return loss_sum, token_count, byte_count
+
+
+def score_doc_windows_with_adapter_ttt(
+    args: Hyperparameters,
+    model: GPT,
+    adapter: DocTTTOutputAdapter,
+    doc: Tensor,
+    seq_len: int,
+    stride: int,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float, float]:
+    n_targets = doc.numel() - 1
+    if n_targets <= 0:
+        return 0.0, 0.0, 0.0
+    loss_sum = 0.0
+    token_count = 0.0
+    byte_count = 0.0
+    optimizer = torch.optim.SGD(adapter.parameters(), lr=args.ttt_doc_adapter_lr)
+    model.eval()
+    adapter.train()
+    for ws in range(0, n_targets, stride):
+        end = min(ws + seq_len, n_targets)
+        wlen = end - ws
+        if wlen <= 0:
+            continue
+        local = doc[ws:end + 1].to(device=adapter.a.device, dtype=torch.int64, non_blocking=True)
+        x = local[:-1].unsqueeze(0)
+        y = local[1:].unsqueeze(0)
+        s = 0 if ws == 0 else max(wlen - stride, 0)
+        with torch.inference_mode():
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                hidden = model.forward_features(x)
+                logits = project_logits_with_adapter(model, hidden, adapter)
+            scored_logits = logits[:, s:wlen, :]
+            scored_targets = y[:, s:wlen]
+            scored_nll = F.cross_entropy(
+                scored_logits.reshape(-1, scored_logits.size(-1)).float(),
+                scored_targets.reshape(-1),
+                reduction="none",
+            ).to(torch.float64)
+        loss_sum += float(scored_nll.sum().item())
+        token_count += float(scored_targets.numel())
+        prev = x[:, s:wlen].reshape(-1)
+        tgt = scored_targets.reshape(-1)
+        tb = base_bytes_lut[tgt].to(torch.float64)
+        tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+        byte_count += float(tb.sum().item())
+        if args.ttt_doc_adapter_epochs <= 0 or scored_targets.numel() == 0:
+            continue
+        hidden_sel = hidden[:, s:wlen, :].float().detach().clone()
+        target_sel = scored_targets.detach().clone()
+        for _ in range(args.ttt_doc_adapter_epochs):
+            optimizer.zero_grad(set_to_none=True)
+            logits_sel = project_logits_with_adapter(model, hidden_sel, adapter)
+            loss = F.cross_entropy(
+                logits_sel.reshape(-1, logits_sel.size(-1)).float(),
+                target_sel.reshape(-1),
+                reduction="mean",
+            )
+            if args.ttt_doc_adapter_weight_decay > 0.0:
+                reg = adapter.a.square().mean() + adapter.b.square().mean()
+                loss = loss + args.ttt_doc_adapter_weight_decay * reg
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(adapter.parameters(), args.ttt_doc_adapter_grad_clip)
+            optimizer.step()
+    return loss_sum, token_count, byte_count
+
+
+def train_model_on_doc(args: Hyperparameters, model: GPT, doc: Tensor, ttt_params: list[Tensor], optimizer: torch.optim.Optimizer) -> None:
+    if args.ttt_epochs <= 0 or doc.numel() <= 1:
+        return
+    model.train()
+    for _ in range(args.ttt_epochs):
+        for start_tok in range(0, doc.numel() - 1, args.train_seq_len):
+            end_tok = min(start_tok + args.train_seq_len, doc.numel() - 1)
+            local = doc[start_tok:end_tok + 1].to(device=ttt_params[0].device, dtype=torch.int64, non_blocking=True)
+            if local.numel() <= 1:
+                continue
+            x = local[:-1].unsqueeze(0)
+            y = local[1:].unsqueeze(0)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                loss = model(x, y)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(ttt_params, args.ttt_grad_clip)
+            optimizer.step()
+
+
+def run_eval_hypothesis(
+    args: Hyperparameters,
+    base_model: GPT,
+    device: torch.device,
+    sp: spm.SentencePieceProcessor,
+    val_stream: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    log0,
+) -> None:
+    docs = split_validation_documents(val_stream, int(sp.bos_id()), args.ttt_max_docs)
+    seq_len = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
+    log0(
+        f"hypothesis_eval docs:{len(docs)} eval_seq_len:{seq_len} stride:{args.eval_stride} "
+        f"ttt_enabled:{args.ttt_enabled} adapter_rank:{args.ttt_doc_adapter_rank}"
+    )
+
+    def summarize(tag: str, loss_sum: float, token_count: float, byte_count: float, elapsed_s: float) -> tuple[float, float]:
+        val_loss = loss_sum / max(token_count, 1.0)
+        val_bpb = val_loss / math.log(2.0) * (token_count / max(byte_count, 1.0))
+        log0(
+            f"{tag} docs:{len(docs)} tokens:{int(token_count)} val_loss:{val_loss:.6f} "
+            f"val_bpb:{val_bpb:.6f} elapsed_s:{elapsed_s:.2f}"
+        )
+        return val_loss, val_bpb
+
+    t0 = time.perf_counter()
+    b_loss = b_tok = b_byte = 0.0
+    for doc in docs:
+        ls, tc, bc = score_doc_windows(
+            base_model, doc, seq_len, args.eval_stride,
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+        b_loss += ls
+        b_tok += tc
+        b_byte += bc
+    _, baseline_bpb = summarize("eval_baseline_doc_sliding", b_loss, b_tok, b_byte, time.perf_counter() - t0)
+
+    if not args.ttt_enabled:
+        return
+
+    persistent_model = copy.deepcopy(base_model).to(device)
+    restore_low_dim_params_to_fp32(persistent_model)
+    frozen_block_ids = set(range(min(args.ttt_freeze_blocks, len(persistent_model.blocks))))
+    ttt_params = []
+    for name, p in persistent_model.named_parameters():
+        freeze = any(f"blocks.{bi}." in name for bi in frozen_block_ids)
+        if freeze:
+            p.requires_grad_(False)
+        else:
+            p.requires_grad_(True)
+            ttt_params.append(p)
+    model_optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+    t0 = time.perf_counter()
+    p_loss = p_tok = p_byte = 0.0
+    for di, doc in enumerate(docs):
+        ls, tc, bc = score_doc_windows(
+            persistent_model, doc, seq_len, args.eval_stride,
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+        p_loss += ls
+        p_tok += tc
+        p_byte += bc
+        if di != len(docs) - 1:
+            train_model_on_doc(args, persistent_model, doc, ttt_params, model_optimizer)
+    _, persistent_bpb = summarize("eval_persistent_doc_ttt", p_loss, p_tok, p_byte, time.perf_counter() - t0)
+    log0(f"eval_persistent_doc_ttt_delta_vs_baseline:{persistent_bpb - baseline_bpb:+.6f}")
+
+    if args.ttt_doc_adapter_rank <= 0:
+        return
+
+    hybrid_model = copy.deepcopy(base_model).to(device)
+    restore_low_dim_params_to_fp32(hybrid_model)
+    hybrid_params = []
+    for name, p in hybrid_model.named_parameters():
+        freeze = any(f"blocks.{bi}." in name for bi in frozen_block_ids)
+        if freeze:
+            p.requires_grad_(False)
+        else:
+            p.requires_grad_(True)
+            hybrid_params.append(p)
+    hybrid_optimizer = torch.optim.SGD(hybrid_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+    adapter = DocTTTOutputAdapter(args.model_dim, args.vocab_size, args.ttt_doc_adapter_rank, args.ttt_doc_adapter_init_std, device)
+    t0 = time.perf_counter()
+    h_loss = h_tok = h_byte = 0.0
+    for di, doc in enumerate(docs):
+        adapter.reset_parameters()
+        ls, tc, bc = score_doc_windows_with_adapter_ttt(
+            args, hybrid_model, adapter, doc, seq_len, args.eval_stride,
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+        h_loss += ls
+        h_tok += tc
+        h_byte += bc
+        if di != len(docs) - 1:
+            train_model_on_doc(args, hybrid_model, doc, hybrid_params, hybrid_optimizer)
+    _, hybrid_bpb = summarize("eval_hybrid_doc_ttt", h_loss, h_tok, h_byte, time.perf_counter() - t0)
+    log0(f"eval_hybrid_doc_ttt_delta_vs_baseline:{hybrid_bpb - baseline_bpb:+.6f}")
+    log0(f"eval_hybrid_doc_ttt_delta_vs_persistent:{hybrid_bpb - persistent_bpb:+.6f}")
 
 
 # -----------------------------
@@ -733,7 +1070,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if not args.eval_only:
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -745,6 +1083,8 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
+    if args.eval_only and world_size != 1:
+        raise NotImplementedError("EVAL_ONLY hypothesis harness currently supports single-GPU runs only")
     if 8 % world_size != 0:
         raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
     grad_accum_steps = 8 // world_size
@@ -811,13 +1151,19 @@ def main() -> None:
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    val_stream = load_validation_stream(args.val_files, max_tokens=args.val_max_tokens)
+    usable_val = ((val_stream.numel() - 1) // args.train_seq_len) * args.train_seq_len
+    if usable_val <= 0:
+        raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={args.train_seq_len}")
+    val_tokens = val_stream[: usable_val + 1]
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    if args.val_max_tokens > 0:
+        log0(f"WARNING: val_loader:subset val_max_tokens:{args.val_max_tokens}")
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -840,6 +1186,25 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    if args.eval_only:
+        if not args.load_checkpoint:
+            raise ValueError("EVAL_ONLY=1 requires LOAD_CHECKPOINT=/path/to/final_model.pt or .ptz")
+        log0(f"eval_only:1 load_checkpoint:{args.load_checkpoint}")
+        base_model.load_state_dict(load_checkpoint_state_dict(args.load_checkpoint), strict=True)
+        run_eval_hypothesis(
+            args,
+            base_model,
+            device,
+            sp,
+            val_stream,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            log0,
+        )
+        if distributed:
+            dist.destroy_process_group()
+        return
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
