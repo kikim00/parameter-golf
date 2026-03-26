@@ -1760,6 +1760,11 @@ def main() -> None:
             baseline_label = "sliding"
             baseline_bpb = sw_val_bpb
         if args.ttt_enabled:
+            if args.ttt_doc_adapter_rank > 0 and args.ttt_doc_adapter_max_docs > 0:
+                log0(
+                    f"eval_warning: hybrid path is restricted to first {args.ttt_doc_adapter_max_docs} BOS-delimited docs; "
+                    "its BPB is not directly comparable to full-validation legal TTT or sliding numbers"
+                )
             restore_eval_model()
             legal_ttt_loss, legal_ttt_bpb = eval_val_sliding_ttt(
                 args, base_model, rank, world_size, device,
