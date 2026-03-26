@@ -1222,6 +1222,22 @@ def main() -> None:
             raise ValueError("EVAL_ONLY=1 requires LOAD_CHECKPOINT=/path/to/final_model.pt or .ptz")
         log0(f"eval_only:1 load_checkpoint:{args.load_checkpoint}")
         base_model.load_state_dict(load_checkpoint_state_dict(args.load_checkpoint), strict=True)
+        flat_val_loss, flat_val_bpb = eval_val(
+            base_model,
+            args,
+            device,
+            rank,
+            world_size,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        log0(
+            f"eval_trainer_flat tokens:{val_tokens.numel() - 1} "
+            f"val_loss:{flat_val_loss:.6f} val_bpb:{flat_val_bpb:.6f}"
+        )
         run_eval_hypothesis(
             args,
             base_model,
