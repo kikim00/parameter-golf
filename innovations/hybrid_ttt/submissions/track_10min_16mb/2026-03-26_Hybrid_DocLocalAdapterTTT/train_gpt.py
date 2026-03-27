@@ -1363,6 +1363,7 @@ def eval_val_doc_local_ttt(
     docs = split_validation_documents(val_tokens, bos_token_id, args.ttt_doc_adapter_max_docs)
     total_docs = len(docs)
     local_docs = docs[rank::world_size]
+    max_local_docs = (total_docs + world_size - 1) // world_size
     doc_adapter = None
     if use_adapter:
         doc_adapter = DocTTTOutputAdapter(
@@ -1407,100 +1408,128 @@ def eval_val_doc_local_ttt(
     )
     if world_size > 1 and use_model_ttt:
         log0(
-            f"{log_prefix}:distributed mode uses rank-local persistent base-model TTT streams; "
-            "metrics are reduced globally after scoring"
+            f"{log_prefix}:distributed mode uses synchronized base-model TTT updates over "
+            "rank-local document minibatches; metrics are reduced globally after scoring"
         )
     t0 = time.perf_counter()
 
-    for di, doc in enumerate(local_docs):
-        n_targets = doc.numel() - 1
-        if n_targets <= 0:
-            continue
+    for di in range(max_local_docs):
+        has_doc = di < len(local_docs)
+        doc = local_docs[di] if has_doc else None
+        n_targets = doc.numel() - 1 if doc is not None else 0
+        if has_doc and n_targets <= 0:
+            has_doc = False
+            doc = None
+            n_targets = 0
 
         adapter_optimizer = None
-        if use_adapter:
+        if use_adapter and has_doc:
             assert doc_adapter is not None
             doc_adapter.reset_parameters()
             adapter_optimizer = torch.optim.SGD(doc_adapter.parameters(), lr=args.ttt_doc_adapter_lr)
             doc_adapter.train()
 
         base_model.eval()
-        for ws in range(0, n_targets, args.eval_stride):
-            end = min(ws + score_seq_len, n_targets)
-            wlen = end - ws
-            if wlen <= 0:
-                continue
-            local = doc[ws:end + 1].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].unsqueeze(0)
-            y = local[1:].unsqueeze(0)
-            s = 0 if ws == 0 else max(wlen - args.eval_stride, 0)
+        if has_doc:
+            for ws in range(0, n_targets, args.eval_stride):
+                end = min(ws + score_seq_len, n_targets)
+                wlen = end - ws
+                if wlen <= 0:
+                    continue
+                local = doc[ws:end + 1].to(device=device, dtype=torch.int64, non_blocking=True)
+                x = local[:-1].unsqueeze(0)
+                y = local[1:].unsqueeze(0)
+                s = 0 if ws == 0 else max(wlen - args.eval_stride, 0)
 
-            with torch.inference_mode():
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    hidden = base_model.forward_features(x)
-                logits = project_logits_with_adapter(base_model, hidden, doc_adapter if use_adapter else None)
-                scored_logits = logits[:, s:wlen, :]
-                scored_targets = y[:, s:wlen]
-                scored_nll = F.cross_entropy(
-                    scored_logits.reshape(-1, scored_logits.size(-1)).float(),
-                    scored_targets.reshape(-1),
-                    reduction="none",
-                ).to(torch.float64)
-            loss_sum += scored_nll.sum()
-            token_count += float(scored_targets.numel())
-            prev = x[:, s:wlen].reshape(-1)
-            tgt = scored_targets.reshape(-1)
-            tb = base_bytes_lut[tgt].to(torch.float64)
-            tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
-            byte_count += tb.sum()
+                with torch.inference_mode():
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        hidden = base_model.forward_features(x)
+                    logits = project_logits_with_adapter(base_model, hidden, doc_adapter if use_adapter else None)
+                    scored_logits = logits[:, s:wlen, :]
+                    scored_targets = y[:, s:wlen]
+                    scored_nll = F.cross_entropy(
+                        scored_logits.reshape(-1, scored_logits.size(-1)).float(),
+                        scored_targets.reshape(-1),
+                        reduction="none",
+                    ).to(torch.float64)
+                loss_sum += scored_nll.sum()
+                token_count += float(scored_targets.numel())
+                prev = x[:, s:wlen].reshape(-1)
+                tgt = scored_targets.reshape(-1)
+                tb = base_bytes_lut[tgt].to(torch.float64)
+                tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+                byte_count += tb.sum()
 
-            if use_adapter and args.ttt_doc_adapter_epochs > 0 and scored_targets.numel() > 0:
-                assert doc_adapter is not None and adapter_optimizer is not None
-                hidden_sel = hidden[:, s:wlen, :].float().detach().clone()
-                target_sel = scored_targets.detach().clone()
-                for _ in range(args.ttt_doc_adapter_epochs):
-                    adapter_optimizer.zero_grad(set_to_none=True)
-                    logits_sel = project_logits_with_adapter(base_model, hidden_sel, doc_adapter)
-                    adapter_loss = F.cross_entropy(
-                        logits_sel.reshape(-1, logits_sel.size(-1)).float(),
-                        target_sel.reshape(-1),
-                        reduction="mean",
-                    )
-                    if args.ttt_doc_adapter_weight_decay > 0.0:
-                        reg = doc_adapter.a.square().mean() + doc_adapter.b.square().mean()
-                        adapter_loss = adapter_loss + args.ttt_doc_adapter_weight_decay * reg
-                    adapter_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(doc_adapter.parameters(), args.ttt_doc_adapter_grad_clip)
-                    adapter_optimizer.step()
+                if use_adapter and args.ttt_doc_adapter_epochs > 0 and scored_targets.numel() > 0:
+                    assert doc_adapter is not None and adapter_optimizer is not None
+                    hidden_sel = hidden[:, s:wlen, :].float().detach().clone()
+                    target_sel = scored_targets.detach().clone()
+                    for _ in range(args.ttt_doc_adapter_epochs):
+                        adapter_optimizer.zero_grad(set_to_none=True)
+                        logits_sel = project_logits_with_adapter(base_model, hidden_sel, doc_adapter)
+                        adapter_loss = F.cross_entropy(
+                            logits_sel.reshape(-1, logits_sel.size(-1)).float(),
+                            target_sel.reshape(-1),
+                            reduction="mean",
+                        )
+                        if args.ttt_doc_adapter_weight_decay > 0.0:
+                            reg = doc_adapter.a.square().mean() + doc_adapter.b.square().mean()
+                            adapter_loss = adapter_loss + args.ttt_doc_adapter_weight_decay * reg
+                        adapter_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(doc_adapter.parameters(), args.ttt_doc_adapter_grad_clip)
+                        adapter_optimizer.step()
 
-        is_last_doc = di == len(local_docs) - 1
-        if use_model_ttt and not is_last_doc and args.ttt_epochs > 0:
+        is_last_round = di == max_local_docs - 1
+        if use_model_ttt and not is_last_round and args.ttt_epochs > 0:
             assert model_optimizer is not None
             clear_rotary_caches(base_model)
             base_model.train()
-            cos_lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * di / max(len(local_docs) - 1, 1)))
+            cos_lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * di / max(max_local_docs - 1, 1)))
             for pg in model_optimizer.param_groups:
                 pg["lr"] = cos_lr
+            local_doc_batches = (n_targets + args.train_seq_len - 1) // args.train_seq_len if has_doc else 0
+            max_doc_batches = local_doc_batches
+            if dist.is_available() and dist.is_initialized():
+                max_doc_batches_t = torch.tensor(local_doc_batches, device=device, dtype=torch.int64)
+                dist.all_reduce(max_doc_batches_t, op=dist.ReduceOp.MAX)
+                max_doc_batches = int(max_doc_batches_t.item())
             for _ep in range(args.ttt_epochs):
-                for start_tok in range(0, n_targets, args.train_seq_len):
-                    end_tok = min(start_tok + args.train_seq_len, n_targets)
-                    local = doc[start_tok:end_tok + 1].to(device=device, dtype=torch.int64, non_blocking=True)
-                    if local.numel() <= 1:
-                        continue
-                    x = local[:-1].unsqueeze(0)
-                    y = local[1:].unsqueeze(0)
+                for batch_idx in range(max_doc_batches):
                     model_optimizer.zero_grad(set_to_none=True)
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        loss = base_model(x, y)
-                    loss.backward()
+                    has_batch = has_doc and batch_idx < local_doc_batches
+                    if has_batch:
+                        start_tok = batch_idx * args.train_seq_len
+                        end_tok = min(start_tok + args.train_seq_len, n_targets)
+                        local = doc[start_tok:end_tok + 1].to(device=device, dtype=torch.int64, non_blocking=True)
+                        if local.numel() <= 1:
+                            has_batch = False
+                        else:
+                            x = local[:-1].unsqueeze(0)
+                            y = local[1:].unsqueeze(0)
+                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                                loss = base_model(x, y)
+                            loss.backward()
+                    active_ranks = 1 if has_batch else 0
+                    if dist.is_available() and dist.is_initialized():
+                        active_ranks_t = torch.tensor(active_ranks, device=device, dtype=torch.int64)
+                        dist.all_reduce(active_ranks_t, op=dist.ReduceOp.SUM)
+                        active_ranks = int(active_ranks_t.item())
+                    if active_ranks == 0:
+                        continue
+                    if dist.is_available() and dist.is_initialized():
+                        for p in ttt_params:
+                            if p.grad is None:
+                                p.grad = torch.zeros_like(p)
+                            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                            p.grad.div_(float(active_ranks))
                     torch.nn.utils.clip_grad_norm_(ttt_params, args.ttt_grad_clip)
                     model_optimizer.step()
 
-        if rank == 0 and (di % 25 == 0 or di == len(local_docs) - 1):
+        if rank == 0 and (di % 25 == 0 or di == max_local_docs - 1):
             elapsed = time.perf_counter() - t0
             rl = loss_sum.item() / max(token_count.item(), 1)
             rbpb = rl / math.log(2.0) * (token_count.item() / max(byte_count.item(), 1)) if token_count.item() > 0 else 0.0
-            log0(f"  {log_prefix} [{di+1}/{len(local_docs)} local, total_docs={total_docs}] bpb={rbpb:.6f} time={elapsed:.1f}s")
+            log0(f"  {log_prefix} [{di+1}/{max_local_docs} rounds, total_docs={total_docs}] bpb={rbpb:.6f} time={elapsed:.1f}s")
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)

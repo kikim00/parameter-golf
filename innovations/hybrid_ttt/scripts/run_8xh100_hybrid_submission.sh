@@ -78,7 +78,11 @@ export SEED="${SEED:-1337}"
 } > "$EVIDENCE_DIR/run_meta.txt"
 
 git -C "$REPO_DIR" status --short > "$EVIDENCE_DIR/git_status.txt" || true
-git -C "$REPO_DIR" diff --name-only openai/main...HEAD > "$EVIDENCE_DIR/git_diff_vs_openai_main.txt" || true
+if git -C "$REPO_DIR" rev-parse --verify openai/main >/dev/null 2>&1; then
+  git -C "$REPO_DIR" diff --name-only openai/main...HEAD > "$EVIDENCE_DIR/git_diff_vs_openai_main.txt" || true
+else
+  echo "openai/main not available in this clone" > "$EVIDENCE_DIR/git_diff_vs_openai_main.txt"
+fi
 nvidia-smi -L > "$EVIDENCE_DIR/nvidia_smi_L.txt"
 nvidia-smi topo -m > "$EVIDENCE_DIR/nvidia_smi_topo.txt" || true
 nvidia-smi > "$EVIDENCE_DIR/nvidia_smi.txt"
@@ -99,8 +103,39 @@ STDOUT_LOG="$EVIDENCE_DIR/stdout.log"
 TIME_LOG="$EVIDENCE_DIR/process_time.txt"
 
 cd "$REPO_DIR"
-/usr/bin/time -f 'elapsed_seconds=%e\nmax_rss_kb=%M' -o "$TIME_LOG" \
-  torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" "$PY_SCRIPT" 2>&1 | tee "$STDOUT_LOG"
+echo "=== nvidia-smi -L ===" | tee "$STDOUT_LOG"
+nvidia-smi -L | tee -a "$STDOUT_LOG"
+echo | tee -a "$STDOUT_LOG"
+
+if [[ -x /usr/bin/time ]]; then
+  /usr/bin/time -f 'elapsed_seconds=%e\nmax_rss_kb=%M' -o "$TIME_LOG" \
+    torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" "$PY_SCRIPT" 2>&1 | tee -a "$STDOUT_LOG"
+else
+  start_ts="$(python3 - <<'PY'
+import time
+print(time.time())
+PY
+)"
+  set +e
+  torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" "$PY_SCRIPT" 2>&1 | tee -a "$STDOUT_LOG"
+  torchrun_status=${PIPESTATUS[0]}
+  set -e
+  end_ts="$(python3 - <<'PY'
+import time
+print(time.time())
+PY
+)"
+  python3 - "$start_ts" "$end_ts" > "$TIME_LOG" <<'PY'
+import sys
+start = float(sys.argv[1])
+end = float(sys.argv[2])
+print(f"elapsed_seconds={end - start:.3f}")
+print("max_rss_kb=unavailable")
+PY
+  if [[ $torchrun_status -ne 0 ]]; then
+    exit "$torchrun_status"
+  fi
+fi
 
 if [[ -f "$TRAIN_LOG" ]]; then
   cp "$TRAIN_LOG" "$EVIDENCE_DIR/train_log.txt"
@@ -119,7 +154,7 @@ done
   echo
   echo "=== key log lines ==="
   if [[ -f "$TRAIN_LOG" ]]; then
-    rg -n "world_size:|train_batch_tokens:|step:.* val_loss|stopping_early|Serialized model int6\\+lzma|Total submission size int6\\+lzma|final_int6_roundtrip_exact|final_int6_sliding_window_exact|final_int6_sliding_window_s64_exact|legal_ttt_exact|legal_ttt_doc_adapter_exact|eval_time:|distributed mode uses rank-local persistent base-model TTT streams" "$TRAIN_LOG" || true
+    rg -n "world_size:|train_batch_tokens:|step:.* val_loss|stopping_early|Serialized model int6\\+lzma|Total submission size int6\\+lzma|final_int6_roundtrip_exact|final_int6_sliding_window_exact|final_int6_sliding_window_s64_exact|legal_ttt_exact|legal_ttt_doc_adapter_exact|eval_time:|distributed mode uses synchronized base-model TTT updates" "$TRAIN_LOG" || true
   else
     echo "train log not found: $TRAIN_LOG"
   fi

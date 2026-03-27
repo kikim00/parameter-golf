@@ -21,7 +21,7 @@ Not finalized. The 8xH100 run has not been executed yet, so the metrics in `subm
 
 ## Important distributed note
 
-On `world_size > 1`, document-local evaluation uses rank-local document streams and globally reduces `loss_sum`, `token_count`, and `byte_count` at the end. If `TTT_EPOCHS > 0`, the base-model TTT state is therefore persistent per rank rather than one globally synchronized document stream.
+On `world_size > 1`, document-local evaluation shards documents across ranks for scoring and keeps the reset-per-document adapter local to each rank's current document. If `TTT_EPOCHS > 0`, the base-model TTT gradients are averaged across the active ranks after each scored document minibatch, so the persistent base-model state remains synchronized across GPUs.
 
 ## Direct run command
 

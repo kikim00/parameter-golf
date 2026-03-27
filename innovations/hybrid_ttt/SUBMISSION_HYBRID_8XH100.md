@@ -10,8 +10,8 @@ Canonical submission-style folder:
 Important behavior:
 - Training uses the leader-style 11-layer recipe in [leader_2026_03_23_train_gpt.py](/Users/kdk/parameter-golf/innovations/hybrid_ttt/leader_2026_03_23_train_gpt.py).
 - Final evaluation enables the document-local adapter path by setting `TTT_DOC_ADAPTER_RANK>0`.
-- On `world_size>1`, document-local evaluation uses rank-local document streams and reduces `loss_sum`, `token_count`, and `byte_count` globally at the end.
-- If `TTT_EPOCHS>0`, the base-model component of doc-local TTT is therefore rank-local persistent state during evaluation, not a fully synchronized global stream.
+- On `world_size>1`, document-local evaluation uses rank-local document shards for scoring, keeps adapters local per document, and reduces `loss_sum`, `token_count`, and `byte_count` globally at the end.
+- If `TTT_EPOCHS>0`, the base-model component of doc-local TTT now synchronizes gradients across ranks after each scored document minibatch, so the persistent base-model state stays shared across GPUs.
 
 Single run:
 
@@ -52,4 +52,4 @@ Before treating this as a final record submission, verify:
 - eval finished within the separate `600s` budget
 - artifact size is under `16MB`
 - repeated seeds are statistically convincing
-- the documented distributed doc-local evaluation behavior is acceptable for the submission
+- the synchronized doc-minibatch TTT behavior is acceptable for the submission
