@@ -13,6 +13,8 @@ TORCH_VERSION="${TORCH_VERSION:-2.9.1}"
 TORCH_CUDA_TAG="${TORCH_CUDA_TAG:-cu128}"
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/$TORCH_CUDA_TAG}"
 INSTALL_FA3="${INSTALL_FA3:-1}"
+FA3_WHEEL_PACKAGE="${FA3_WHEEL_PACKAGE:-flash_attn_3}"
+FA3_WHEEL_LINKS="${FA3_WHEEL_LINKS:-https://windreamer.github.io/flash-attention3-wheels/cu128_torch291}"
 FA3_DIR="${FA3_DIR:-$REPO_DIR/.deps/flash-attention}"
 FA3_LOG="${FA3_LOG:-$REPO_DIR/logs/fa3_build.log}"
 MAX_JOBS="${MAX_JOBS:-1}"
@@ -108,15 +110,19 @@ PY
   then
     echo "flash_attn_interface already importable"
   else
-    echo "== installing FlashAttention-3 Hopper build =="
-    if [[ ! -d "$FA3_DIR/.git" ]]; then
-      git clone https://github.com/Dao-AILab/flash-attention "$FA3_DIR"
+    echo "== installing FlashAttention-3 wheel =="
+    if ! python -m pip install "$FA3_WHEEL_PACKAGE" --find-links "$FA3_WHEEL_LINKS"; then
+      echo "wheel install failed, falling back to source build" >&2
+      echo "== installing FlashAttention-3 Hopper build from source ==" >&2
+      if [[ ! -d "$FA3_DIR/.git" ]]; then
+        git clone https://github.com/Dao-AILab/flash-attention "$FA3_DIR"
+      fi
+      git -C "$FA3_DIR" submodule update --init --recursive
+      pushd "$FA3_DIR/hopper" >/dev/null
+      python setup.py clean --all || true
+      MAX_JOBS="$MAX_JOBS" python setup.py install 2>&1 | tee "$FA3_LOG"
+      popd >/dev/null
     fi
-    git -C "$FA3_DIR" submodule update --init --recursive
-    pushd "$FA3_DIR/hopper" >/dev/null
-    python setup.py clean --all || true
-    MAX_JOBS="$MAX_JOBS" python setup.py install 2>&1 | tee "$FA3_LOG"
-    popd >/dev/null
     python - <<'PY'
 import flash_attn_interface
 

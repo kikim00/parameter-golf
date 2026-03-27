@@ -65,5 +65,6 @@ Before treating this as a final record submission, verify:
 
 Fresh-pod notes:
 - [bootstrap_h100_pod.sh](/Users/kdk/parameter-golf/innovations/hybrid_ttt/scripts/bootstrap_h100_pod.sh) creates or reuses `.venv`, installs `torch==2.9.1+cu128`, places Hugging Face caches under the repo instead of `/root/.cache`, downloads the cached FineWeb export, and optionally compiles FA3.
+- The bootstrap now prefers the prebuilt FA3 wheel first: `pip install flash_attn_3 --find-links https://windreamer.github.io/flash-attention3-wheels/cu128_torch291`, and only falls back to a source build if that fails.
 - `TRAIN_SHARDS=1 INSTALL_FA3=0 bash innovations/hybrid_ttt/scripts/bootstrap_h100_pod.sh` is the cheapest smoke setup.
 - The submission wrapper now defaults `HF_HOME` to `REPO/.hf_home` and `XDG_CACHE_HOME` to `REPO/.cache` so dataset downloads survive within the repo volume rather than the tiny root cache.
