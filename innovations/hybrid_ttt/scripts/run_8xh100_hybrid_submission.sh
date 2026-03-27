@@ -59,6 +59,22 @@ export MAX_WALLCLOCK_SECONDS="${MAX_WALLCLOCK_SECONDS:-600}"
 export EVAL_STRIDE="${EVAL_STRIDE:-64}"
 export SEED="${SEED:-1337}"
 
+if [[ ! -f "$TOKENIZER_PATH" ]]; then
+  echo "missing tokenizer: $TOKENIZER_PATH" >&2
+  echo "populate data with: python3 data/cached_challenge_fineweb.py --variant sp1024" >&2
+  exit 1
+fi
+if ! compgen -G "$DATA_PATH/fineweb_train_*.bin" > /dev/null; then
+  echo "missing training shards under: $DATA_PATH" >&2
+  echo "populate data with: python3 data/cached_challenge_fineweb.py --variant sp1024" >&2
+  exit 1
+fi
+if ! compgen -G "$DATA_PATH/fineweb_val_*.bin" > /dev/null; then
+  echo "missing validation shards under: $DATA_PATH" >&2
+  echo "populate data with: python3 data/cached_challenge_fineweb.py --variant sp1024" >&2
+  exit 1
+fi
+
 {
   echo "run_id=$RUN_ID"
   echo "utc_start=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
