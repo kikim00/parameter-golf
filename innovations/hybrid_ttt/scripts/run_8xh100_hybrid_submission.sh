@@ -10,6 +10,7 @@ PY_SCRIPT="$SUBMISSION_DIR/train_gpt.py"
 RUN_ID="${RUN_ID:-hybrid_submission_8xh100_$(date -u +%Y%m%dT%H%M%SZ)}"
 EVIDENCE_DIR="${EVIDENCE_DIR:-$INNOVATION_DIR/submission_runs/$RUN_ID}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3)}"
 
 mkdir -p "$EVIDENCE_DIR"
 
@@ -21,6 +22,19 @@ export TOKENIZER_PATH="${TOKENIZER_PATH:-$REPO_DIR/data/tokenizers/fineweb_1024_
 export ATTN_BACKEND="${ATTN_BACKEND:-auto}"
 
 mkdir -p "$HF_HOME" "$XDG_CACHE_HOME"
+
+if ! "$PYTHON_BIN" - <<'PY' >/dev/null 2>&1
+import datasets
+import sentencepiece
+import tiktoken
+import torch
+PY
+then
+  echo "python environment missing required packages for submission run" >&2
+  echo "python_bin=$PYTHON_BIN" >&2
+  echo "run bootstrap first: bash innovations/hybrid_ttt/scripts/bootstrap_h100_pod.sh" >&2
+  exit 1
+fi
 
 # March 23 leader-style defaults plus document-local adapter TTT.
 export NUM_LAYERS="${NUM_LAYERS:-11}"
@@ -88,6 +102,7 @@ fi
   echo "commit=$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || true)"
   echo "openai_main=$(git -C "$REPO_DIR" rev-parse openai/main 2>/dev/null || true)"
   echo "nproc_per_node=$NPROC_PER_NODE"
+  echo "python_bin=$PYTHON_BIN"
   echo "attn_backend=$ATTN_BACKEND"
   echo "hf_home=$HF_HOME"
   echo "xdg_cache_home=$XDG_CACHE_HOME"
@@ -108,7 +123,7 @@ fi
 nvidia-smi -L > "$EVIDENCE_DIR/nvidia_smi_L.txt"
 nvidia-smi topo -m > "$EVIDENCE_DIR/nvidia_smi_topo.txt" || true
 nvidia-smi > "$EVIDENCE_DIR/nvidia_smi.txt"
-python3 - <<'PY' > "$EVIDENCE_DIR/python_torch_env.txt"
+"$PYTHON_BIN" - <<'PY' > "$EVIDENCE_DIR/python_torch_env.txt"
 import os, sys, torch
 print("python", sys.version)
 print("torch", torch.__version__)
@@ -134,23 +149,23 @@ echo | tee -a "$STDOUT_LOG"
 
 if [[ -x /usr/bin/time ]]; then
   /usr/bin/time -f 'elapsed_seconds=%e\nmax_rss_kb=%M' -o "$TIME_LOG" \
-    torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" "$PY_SCRIPT" 2>&1 | tee -a "$STDOUT_LOG"
+    "$PYTHON_BIN" -m torch.distributed.run --standalone --nproc_per_node="$NPROC_PER_NODE" "$PY_SCRIPT" 2>&1 | tee -a "$STDOUT_LOG"
 else
-  start_ts="$(python3 - <<'PY'
+  start_ts="$("$PYTHON_BIN" - <<'PY'
 import time
 print(time.time())
 PY
 )"
   set +e
-  torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" "$PY_SCRIPT" 2>&1 | tee -a "$STDOUT_LOG"
+  "$PYTHON_BIN" -m torch.distributed.run --standalone --nproc_per_node="$NPROC_PER_NODE" "$PY_SCRIPT" 2>&1 | tee -a "$STDOUT_LOG"
   torchrun_status=${PIPESTATUS[0]}
   set -e
-  end_ts="$(python3 - <<'PY'
+  end_ts="$("$PYTHON_BIN" - <<'PY'
 import time
 print(time.time())
 PY
 )"
-  python3 - "$start_ts" "$end_ts" > "$TIME_LOG" <<'PY'
+  "$PYTHON_BIN" - "$start_ts" "$end_ts" > "$TIME_LOG" <<'PY'
 import sys
 start = float(sys.argv[1])
 end = float(sys.argv[2])
