@@ -94,7 +94,10 @@ print("torch_cuda", torch.version.cuda)
 print("cuda_available", torch.cuda.is_available())
 print("device_count", torch.cuda.device_count())
 for i in range(torch.cuda.device_count()):
-    print("device", i, torch.cuda.get_device_name(i))
+    try:
+        print("device", i, torch.cuda.get_device_name(i))
+    except Exception as exc:
+        print("device", i, f"<unavailable: {exc}>")
 print("env_run_id", os.getenv("RUN_ID"))
 PY
 
