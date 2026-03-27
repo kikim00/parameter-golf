@@ -17,6 +17,15 @@ Single run:
 
 ```bash
 source .venv/bin/activate
+bash innovations/hybrid_ttt/scripts/bootstrap_h100_pod.sh
+ATTN_BACKEND=fa3 RUN_ID=hybrid_submission_seed1337_fa3 SEED=1337 \
+bash innovations/hybrid_ttt/scripts/run_8xh100_hybrid_submission.sh
+```
+
+If you already trust the environment and only want to launch the run:
+
+```bash
+source .venv/bin/activate
 bash innovations/hybrid_ttt/scripts/run_8xh100_hybrid_submission.sh
 ```
 
@@ -53,3 +62,8 @@ Before treating this as a final record submission, verify:
 - artifact size is under `16MB`
 - repeated seeds are statistically convincing
 - the synchronized doc-minibatch TTT behavior is acceptable for the submission
+
+Fresh-pod notes:
+- [bootstrap_h100_pod.sh](/Users/kdk/parameter-golf/innovations/hybrid_ttt/scripts/bootstrap_h100_pod.sh) creates or reuses `.venv`, installs `torch==2.9.1+cu128`, places Hugging Face caches under the repo instead of `/root/.cache`, downloads the cached FineWeb export, and optionally compiles FA3.
+- `TRAIN_SHARDS=1 INSTALL_FA3=0 bash innovations/hybrid_ttt/scripts/bootstrap_h100_pod.sh` is the cheapest smoke setup.
+- The submission wrapper now defaults `HF_HOME` to `REPO/.hf_home` and `XDG_CACHE_HOME` to `REPO/.cache` so dataset downloads survive within the repo volume rather than the tiny root cache.

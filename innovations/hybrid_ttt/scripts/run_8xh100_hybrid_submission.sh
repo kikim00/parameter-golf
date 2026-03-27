@@ -14,9 +14,13 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 mkdir -p "$EVIDENCE_DIR"
 
 export RUN_ID
+export HF_HOME="${HF_HOME:-$REPO_DIR/.hf_home}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$REPO_DIR/.cache}"
 export DATA_PATH="${DATA_PATH:-$REPO_DIR/data/datasets/fineweb10B_sp1024}"
 export TOKENIZER_PATH="${TOKENIZER_PATH:-$REPO_DIR/data/tokenizers/fineweb_1024_bpe.model}"
 export ATTN_BACKEND="${ATTN_BACKEND:-auto}"
+
+mkdir -p "$HF_HOME" "$XDG_CACHE_HOME"
 
 # March 23 leader-style defaults plus document-local adapter TTT.
 export NUM_LAYERS="${NUM_LAYERS:-11}"
@@ -85,6 +89,8 @@ fi
   echo "openai_main=$(git -C "$REPO_DIR" rev-parse openai/main 2>/dev/null || true)"
   echo "nproc_per_node=$NPROC_PER_NODE"
   echo "attn_backend=$ATTN_BACKEND"
+  echo "hf_home=$HF_HOME"
+  echo "xdg_cache_home=$XDG_CACHE_HOME"
   echo "max_wallclock_seconds=$MAX_WALLCLOCK_SECONDS"
   echo "ttt_doc_adapter_rank=$TTT_DOC_ADAPTER_RANK"
   echo "ttt_doc_adapter_epochs=$TTT_DOC_ADAPTER_EPOCHS"
